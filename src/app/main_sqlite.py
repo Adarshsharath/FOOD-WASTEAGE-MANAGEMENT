@@ -838,56 +838,58 @@ def page_manage_claims():
             st.warning('⚠️ No receivers found. Please add receivers first in the "Providers & Receivers" page.')
         else:
             next_id = get_next_id('claims', 'claim_id')
-            with st.form('add_claim_form'):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    claim_id = st.number_input('Claim_ID', step=1, min_value=1, value=next_id)
-                with col2:
-                    st.info(f'Next: {next_id}')
-                
-                # Create food options with IDs and available quantities
-                food_options = {f"{row['food_id']} - {row['food_name']} (Available: {int(row['available_quantity'])})": row['food_id'] for _, row in foods.iterrows()}
-                food_choice = st.selectbox('Food ID - Food Name (Available Quantity)', list(food_options.keys()))
-                selected_food_id = food_options[food_choice]
-                
-                # Get available quantity for selected food
-                selected_food = foods[foods['food_id'] == selected_food_id].iloc[0]
-                max_quantity = int(selected_food['available_quantity'])
-                
-                # Quantity selector
-                claimed_quantity = st.number_input(
-                    f'Quantity to Claim (Max: {max_quantity})', 
-                    min_value=1, 
-                    max_value=max_quantity, 
-                    value=min(1, max_quantity),
-                    step=1
-                )
-                
-                # Create receiver options with IDs
-                receiver_options = {f"{row['receiver_id']} - {row['name']}": row['receiver_id'] for _, row in receivers.iterrows()}
-                recv_choice = st.selectbox('Receiver', list(receiver_options.keys()))
-                selected_receiver_id = receiver_options[recv_choice]
-                
-                status = st.selectbox('Status', ['Pending', 'Completed', 'Cancelled'], index=0)
-                submitted = st.form_submit_button('Create Claim')
-                
-                if submitted:
-                    try:
-                        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        execute_query('''
-                            INSERT INTO claims(claim_id, food_id, receiver_id, claimed_quantity, status, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (claim_id, selected_food_id, selected_receiver_id, claimed_quantity, status, ts))
-                        log_audit('create_claim', f'claim_id={claim_id}, food_id={selected_food_id}, receiver_id={selected_receiver_id}, quantity={claimed_quantity}')
-                        st.success(f'✅ Claim created successfully! Food ID: {selected_food_id}, Receiver ID: {selected_receiver_id}, Quantity: {claimed_quantity}')
-                        st.rerun()
-                    except Exception as e:
-                        if 'UNIQUE constraint failed' in str(e):
-                            st.error(f'❌ Claim ID {claim_id} already exists! Please use a different ID.')
-                        elif 'FOREIGN KEY constraint failed' in str(e):
-                            st.error(f'❌ Invalid Food ID ({selected_food_id}) or Receiver ID ({selected_receiver_id}). Please check your selection.')
-                        else:
-                            st.error(f'❌ Error creating claim: {str(e)}')
+            
+            # Create food options with IDs and available quantities
+            food_options_dict = {f"{row['food_id']} - {row['food_name']} (Available: {int(row['available_quantity'])})": {
+                'food_id': row['food_id'],
+                'available_quantity': int(row['available_quantity'])
+            } for _, row in foods.iterrows()}
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                claim_id = st.number_input('Claim_ID', step=1, min_value=1, value=next_id, key='claim_id_input')
+            with col2:
+                st.info(f'Next: {next_id}')
+            
+            food_choice = st.selectbox('Food ID - Food Name (Available Quantity)', list(food_options_dict.keys()), key='food_select')
+            selected_food_data = food_options_dict[food_choice]
+            selected_food_id = selected_food_data['food_id']
+            max_quantity = selected_food_data['available_quantity']
+            
+            # Quantity selector with dynamic max based on selection
+            claimed_quantity = st.number_input(
+                f'Quantity to Claim (Max: {max_quantity})', 
+                min_value=1, 
+                max_value=max_quantity, 
+                value=1,
+                step=1,
+                key='quantity_input'
+            )
+            
+            # Create receiver options with IDs
+            receiver_options = {f"{row['receiver_id']} - {row['name']}": row['receiver_id'] for _, row in receivers.iterrows()}
+            recv_choice = st.selectbox('Receiver', list(receiver_options.keys()), key='receiver_select')
+            selected_receiver_id = receiver_options[recv_choice]
+            
+            status = st.selectbox('Status', ['Pending', 'Completed', 'Cancelled'], index=0, key='status_select')
+            
+            if st.button('Create Claim', type='primary'):
+                try:
+                    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    execute_query('''
+                        INSERT INTO claims(claim_id, food_id, receiver_id, claimed_quantity, status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (claim_id, selected_food_id, selected_receiver_id, claimed_quantity, status, ts))
+                    log_audit('create_claim', f'claim_id={claim_id}, food_id={selected_food_id}, receiver_id={selected_receiver_id}, quantity={claimed_quantity}')
+                    st.success(f'✅ Claim created successfully! Food ID: {selected_food_id}, Receiver ID: {selected_receiver_id}, Quantity: {claimed_quantity}')
+                    st.rerun()
+                except Exception as e:
+                    if 'UNIQUE constraint failed' in str(e):
+                        st.error(f'❌ Claim ID {claim_id} already exists! Please use a different ID.')
+                    elif 'FOREIGN KEY constraint failed' in str(e):
+                        st.error(f'❌ Invalid Food ID ({selected_food_id}) or Receiver ID ({selected_receiver_id}). Please check your selection.')
+                    else:
+                        st.error(f'❌ Error creating claim: {str(e)}')
     
     with st.expander('Update Claim Status'):
         if not claims.empty:
