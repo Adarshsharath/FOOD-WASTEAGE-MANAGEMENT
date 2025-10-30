@@ -201,6 +201,27 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row  # This allows accessing columns by name
     return conn
 
+def migrate_database():
+    """Migrate existing database to add new columns if needed"""
+    if DB_PATH.exists():
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Check if claimed_quantity column exists in claims table
+            cursor.execute("PRAGMA table_info(claims)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if 'claimed_quantity' not in columns:
+                # Add the claimed_quantity column with default value 0
+                cursor.execute("ALTER TABLE claims ADD COLUMN claimed_quantity INTEGER DEFAULT 0")
+                conn.commit()
+                st.info("✅ Database migrated: Added 'claimed_quantity' column to claims table")
+        except Exception as e:
+            st.warning(f"Migration check: {str(e)}")
+        finally:
+            conn.close()
+
 def import_csv_data():
     """Import CSV files from data/ directory"""
     DATA_DIR = ROOT / 'data'
@@ -420,6 +441,7 @@ def init_database():
                 claim_id INTEGER PRIMARY KEY,
                 food_id INTEGER,
                 receiver_id INTEGER,
+                claimed_quantity INTEGER DEFAULT 0,
                 status TEXT CHECK (status IN ('Pending','Completed','Cancelled')),
                 timestamp DATETIME,
                 FOREIGN KEY (food_id) REFERENCES food_listings(food_id),
@@ -623,9 +645,14 @@ def page_home():
     st.markdown("### 🍕 Available Food Listings")
     
     listings_query = """
-        SELECT f.*, p.city, p.name AS provider_name, p.contact AS provider_contact
+        SELECT f.*, p.city, p.name AS provider_name, p.contact AS provider_contact,
+               COALESCE(SUM(c.claimed_quantity), 0) as total_claimed,
+               (f.quantity - COALESCE(SUM(c.claimed_quantity), 0)) as available_quantity
         FROM food_listings f 
         JOIN providers p ON p.provider_id = f.provider_id
+        LEFT JOIN claims c ON f.food_id = c.food_id AND c.status != 'Cancelled'
+        GROUP BY f.food_id
+        HAVING available_quantity > 0
     """
     listings = run_query(listings_query)
     
@@ -652,8 +679,21 @@ def page_home():
         if f_meal:
             df = df[df['meal_type'].isin(f_meal)]
         
+        # Replace the original quantity column with available quantity for display
+        df['Original_Quantity'] = df['quantity']
+        df['quantity'] = df['available_quantity'].astype(int)
+        
+        # Select and reorder columns for better display
+        display_columns = ['food_id', 'food_name', 'quantity', 'expiry_date', 
+                          'provider_name', 'city', 'food_type', 'meal_type', 
+                          'location', 'provider_contact']
+        
+        # Only include columns that exist
+        display_columns = [col for col in display_columns if col in df.columns]
+        df_display = df[display_columns].copy()
+        
         # Highlight near expiry
-        df['expiry_date'] = pd.to_datetime(df['expiry_date'])
+        df_display['expiry_date'] = pd.to_datetime(df_display['expiry_date'])
         today = pd.Timestamp.now().normalize()
         
         def highlight(row):
@@ -661,7 +701,8 @@ def page_home():
                 return 'background-color: #ffd6d6'
             return ''
         
-        st.dataframe(df.style.apply(lambda r: [highlight(r)] * len(r), axis=1), use_container_width=True)
+        st.info("ℹ️ **Quantity shown is the AVAILABLE quantity** (Original quantity - Claimed quantity)")
+        st.dataframe(df_display.style.apply(lambda r: [highlight(r)] * len(r), axis=1), use_container_width=True)
     else:
         st.info('No food listings found')
 
@@ -777,7 +818,16 @@ def page_manage_listings():
 def page_manage_claims():
     st.header('Manage Claims (CRUD)')
     
-    foods = run_query("SELECT food_id, food_name, provider_id FROM food_listings")
+    # Get food listings with available quantities
+    foods = run_query("""
+        SELECT f.food_id, f.food_name, f.quantity, f.provider_id,
+               COALESCE(SUM(c.claimed_quantity), 0) as total_claimed,
+               (f.quantity - COALESCE(SUM(c.claimed_quantity), 0)) as available_quantity
+        FROM food_listings f
+        LEFT JOIN claims c ON f.food_id = c.food_id AND c.status != 'Cancelled'
+        GROUP BY f.food_id
+        HAVING available_quantity > 0
+    """)
     receivers = run_query("SELECT receiver_id, name FROM receivers")
     claims = run_query("SELECT * FROM claims")
     
@@ -795,10 +845,23 @@ def page_manage_claims():
                 with col2:
                     st.info(f'Next: {next_id}')
                 
-                # Create food options with IDs
-                food_options = {f"{row['food_id']} - {row['food_name']}": row['food_id'] for _, row in foods.iterrows()}
-                food_choice = st.selectbox('Food ID - Food Name', list(food_options.keys()))
+                # Create food options with IDs and available quantities
+                food_options = {f"{row['food_id']} - {row['food_name']} (Available: {int(row['available_quantity'])})": row['food_id'] for _, row in foods.iterrows()}
+                food_choice = st.selectbox('Food ID - Food Name (Available Quantity)', list(food_options.keys()))
                 selected_food_id = food_options[food_choice]
+                
+                # Get available quantity for selected food
+                selected_food = foods[foods['food_id'] == selected_food_id].iloc[0]
+                max_quantity = int(selected_food['available_quantity'])
+                
+                # Quantity selector
+                claimed_quantity = st.number_input(
+                    f'Quantity to Claim (Max: {max_quantity})', 
+                    min_value=1, 
+                    max_value=max_quantity, 
+                    value=min(1, max_quantity),
+                    step=1
+                )
                 
                 # Create receiver options with IDs
                 receiver_options = {f"{row['receiver_id']} - {row['name']}": row['receiver_id'] for _, row in receivers.iterrows()}
@@ -812,11 +875,11 @@ def page_manage_claims():
                     try:
                         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         execute_query('''
-                            INSERT INTO claims(claim_id, food_id, receiver_id, status, timestamp)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (claim_id, selected_food_id, selected_receiver_id, status, ts))
-                        log_audit('create_claim', f'claim_id={claim_id}, food_id={selected_food_id}, receiver_id={selected_receiver_id}')
-                        st.success(f'✅ Claim created successfully! Food ID: {selected_food_id}, Receiver ID: {selected_receiver_id}')
+                            INSERT INTO claims(claim_id, food_id, receiver_id, claimed_quantity, status, timestamp)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (claim_id, selected_food_id, selected_receiver_id, claimed_quantity, status, ts))
+                        log_audit('create_claim', f'claim_id={claim_id}, food_id={selected_food_id}, receiver_id={selected_receiver_id}, quantity={claimed_quantity}')
+                        st.success(f'✅ Claim created successfully! Food ID: {selected_food_id}, Receiver ID: {selected_receiver_id}, Quantity: {claimed_quantity}')
                         st.rerun()
                     except Exception as e:
                         if 'UNIQUE constraint failed' in str(e):
@@ -1312,6 +1375,9 @@ def page_admin():
 def main():
     # Initialize database on first run
     init_database()
+    
+    # Migrate database if needed (add new columns to existing database)
+    migrate_database()
     
     # Sidebar with logo and navigation
     st.sidebar.markdown("""
